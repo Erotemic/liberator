@@ -51,6 +51,7 @@ Issues:
 import ast
 import astunparse
 import copy
+import importlib
 import inspect
 import io
 import sys
@@ -150,6 +151,32 @@ class LocalLogger:
             self.verbose = item.verbose
 
         return self
+
+
+def resolve_modpath(modname):
+    """
+    Resolve a module name to a Python source file path when possible.
+
+    The fallback importlib lookup handles importable modules where
+    :func:`ubelt.modname_to_modpath` returns ``None`` (e.g. ``os.path``).
+
+    Example:
+        >>> from liberator.core import resolve_modpath
+        >>> modpath = resolve_modpath('os.path')
+        >>> assert modpath is not None
+        >>> assert modpath.endswith(('posixpath.py', 'ntpath.py'))
+    """
+    modpath = ub.modname_to_modpath(modname)
+    if modpath is None:
+        try:
+            module = importlib.import_module(modname)
+        except Exception:
+            module = None
+        if module is not None:
+            modpath = getattr(module, '__file__', None)
+    if modpath is not None and modpath.endswith('.pyc'):
+        modpath = modpath[:-1]
+    return modpath
 
 
 class Liberator(ub.NiceRepr):
@@ -666,7 +693,8 @@ class Liberator(ub.NiceRepr):
                         continue
                     still_needs_expansion = True
                     # if d.absname == d.native_modname:
-                    if ub.modname_to_modpath(d.absname):
+                    abs_modpath = resolve_modpath(d.absname)
+                    if abs_modpath:
                         lib.info('TODO: NEED TO CLOSE module = {}'.format(d))
                         # import warnings
                         # warnings.warn('Closing module {} may not be implemented'.format(d))
@@ -681,13 +709,13 @@ class Liberator(ub.NiceRepr):
                         # copy-pasting the relevant code from the other module
                         # (ASSUMING THERE ARE NO NAME CONFLICTS)
 
-                        assert d.type == 'ImportFrom'
-
                         try:
-                            native_modpath = ub.modname_to_modpath(d.native_modname)
+                            native_modpath = resolve_modpath(d.native_modname)
                             if native_modpath is None:
-                                raise Exception('Cannot find the module path for modname={!r}. '
-                                                'Are you missing an __init__.py?'.format(d.native_modname))
+                                lib.warn('Cannot find module path for modname={!r}; skipping expansion '
+                                         'of {!r}'.format(d.native_modname, d))
+                                d._expanded = True
+                                continue
 
                             sub_lib = Liberator(lib.logger.tag + '.sub.' + d.name,
                                                 logger=lib.logger,
@@ -708,11 +736,16 @@ class Liberator(ub.NiceRepr):
                                     ns = {}
                                     exec(d.code, ns, ns)
                                     dynamic_obj = ns[d.name]
-                                    sub_lib.add_dynamic(dynamic_obj)
+                                    if hasattr(dynamic_obj, '__name__'):
+                                        sub_lib.add_dynamic(dynamic_obj)
+                                    else:
+                                        lib.warn('Cannot dynamically add {!r} from {!r}; '
+                                                 'skipping expansion'.format(d.name, d.native_modname))
+                                        d._expanded = True
+                                        continue
                                 else:
                                     raise
 
-                            print(f'native_modpath={native_modpath}')
                             # sub_visitor = sub_lib.visitors[d.native_modname]
                             sub_lib.expand(expand_names)
 
@@ -754,7 +787,7 @@ class Liberator(ub.NiceRepr):
         # closed_visitor = DefinitionVisitor.parse(source=current_sourcecode)
         assert 'Import' in d.type
         varname = d.name
-        varmodpath = ub.modname_to_modpath(d.absname)
+        varmodpath = resolve_modpath(d.absname)
         modname = d.absname
 
         def _exhaust(varname, modname, modpath):
@@ -771,7 +804,7 @@ class Liberator(ub.NiceRepr):
             # For each modified attribute, copy in the appropriate source.
             for subname in rewriter.accessed_attrs:
                 submodname = modname + '.' + subname
-                submodpath = ub.modname_to_modpath(submodname)
+                submodpath = resolve_modpath(submodname)
                 if submodpath is not None:
                     # if the accessor is to another module, exhaust until
                     # we reach a non-module
@@ -1210,6 +1243,26 @@ class RemoveInternalImports(ast.NodeTransformer):
         >>> modified = unparse(pt)
         >>> print(modified)
 
+    Example:
+        >>> from liberator.core import RemoveInternalImports, unparse
+        >>> import ubelt as ub
+        >>> import ast
+        >>> source = ub.codeblock(
+        ...     '''
+        ...     def g(x):
+        ...         \"\"\"hello\"\"\"
+        ...         import math as m
+        ...         return m.ceil(x)
+        ...     ''')
+        >>> pt = ast.parse(source)
+        >>> new_pt = RemoveInternalImports('math').visit(pt)
+        >>> ast.fix_missing_locations(new_pt)
+        >>> code = unparse(new_pt)
+        >>> compile(code, '<doctest>', 'exec')
+        >>> ns = {}
+        >>> exec(code, ns, ns)
+        >>> assert ns['g'].__doc__ == 'hello'
+
     Ignore:
         node = pt1.body[1]
         node = pt.body[1]
@@ -1247,56 +1300,31 @@ class RemoveInternalImports(ast.NodeTransformer):
             matchable_modnames.append(modname_prefix)
         return name in matchable_modnames
 
-    def _comment_node(self, node):
-        """
-        Given a node, produced a commented out version of it
-        """
-        line_value = unparse(node).replace('\n', '')
-        prefix = '# LIBERATED(internal): '
-        extra_offset = 2 + len(prefix)
-        new_node = ast.Constant(
-            prefix + line_value,
-            # line_value,
-            lineno=node.lineno,
-            col_offset=node.col_offset,
-            end_col_offset=node.end_col_offset + extra_offset,
-            end_lineno=node.end_lineno)
-        new_node._no_unparse_hack = 1
-        new_node = ast.Expr(new_node)
-        return new_node
+    def _replacement_node(self, node):
+        """Return a safe placeholder for removed imports."""
+        new_node = ast.Pass()
+        return ast.copy_location(new_node, node)
 
     def visit_Import(self, node):
         # FIXME: multiple imports case
         new_node = None
-        hacked_assigns = []
         for alias in node.names:
             modname = alias.name
             if self._check_match(modname, self.name):
-                if alias.asname is not None:
-                    hacked_assigns.append((alias.asname, alias.name))
-                new_node = self._comment_node(node)
+                new_node = self._replacement_node(node)
                 self.rewritten_nodes.append(node)
         if new_node is None:
             yield node
         else:
             yield new_node
-            # HACK: For aliases as-names, insert assignments
-            for var, val in hacked_assigns:
-                print(f'self.name={self.name}')
-                print(f'val={val}')
-                print(f'var={var}')
-                yield ast.Assign([ast.Name(var)], ast.Name(val))
 
     def visit_ImportFrom(self, node):
         # FIXME: multiple imports case
         new_node = None
-        hacked_assigns = []
         for alias in node.names:
             modname = node.module
             if self._check_match(modname, self.name):
-                if alias.asname is not None:
-                    hacked_assigns.append((alias.asname, alias.name))
-                new_node = self._comment_node(node)
+                new_node = self._replacement_node(node)
                 self.rewritten_nodes.append(node)
         if new_node is None:
             new_node = node
@@ -1304,12 +1332,6 @@ class RemoveInternalImports(ast.NodeTransformer):
             yield node
         else:
             yield new_node
-            # HACK: For aliases as-names, insert assignments
-            for var, val in hacked_assigns:
-                print(f'self.name={self.name}')
-                print(f'val={val}')
-                print(f'var={var}')
-                yield ast.Assign([ast.Name(var)], ast.Name(val))
 
 
 class Definition(ub.NiceRepr):
@@ -1605,7 +1627,7 @@ class DefinitionVisitor(ast.NodeVisitor, ub.NiceRepr):
             if source is None:
                 source = inspect.getsource(module)
             if modpath is None:
-                modname = module.__file__
+                modpath = module.__file__
             if modname is None:
                 modname = module.__name__
 
@@ -1755,16 +1777,36 @@ class DefinitionVisitor(ast.NodeVisitor, ub.NiceRepr):
         #     # ast.NodeVisitor.generic_visit(visitor, node)
 
     def _import_definitions(visitor, node):
+        """
+        Example:
+            >>> import ubelt as ub
+            >>> source = ub.codeblock(
+            ...     '''
+            ...     import a.b.c
+            ...     import d.e as alias
+            ...     ''')
+            >>> v = DefinitionVisitor.parse(source=source, modname='m')
+            >>> d1 = v.definitions['a']
+            >>> assert d1.name == 'a'
+            >>> assert d1.absname == 'a'
+            >>> assert d1.native_modname == 'a.b.c'
+            >>> d2 = v.definitions['alias']
+            >>> assert d2.native_modname == 'd.e'
+        """
         for alias in node.names:
-            varname = alias.asname or alias.name
+            if alias.asname:
+                varname = alias.asname
+                absname = alias.name
+            else:
+                varname = alias.name.split('.')[0]
+                absname = varname
             if alias.asname:
                 line = 'import {} as {}'.format(alias.name, alias.asname)
             else:
                 line = 'import {}'.format(alias.name)
-            absname = alias.name
             yield Definition(varname, node, code=line,
                              absname=absname,
-                             native_modname=absname,
+                             native_modname=alias.name,
                              modpath=visitor.modpath,
                              modname=visitor.modname,
                              type='Import')
@@ -1809,7 +1851,9 @@ class DefinitionVisitor(ast.NodeVisitor, ub.NiceRepr):
             absname = abs_modname + '.' + alias.name
             if varname == '*':
                 # HACK
-                abs_modpath = ub.modname_to_modpath(abs_modname)
+                abs_modpath = resolve_modpath(abs_modname)
+                if abs_modpath is None:
+                    continue
                 star_visitor = DefinitionVisitor.parse(
                     modpath=abs_modpath, logger=visitor.logger)
                 for d in star_visitor.definitions.values():

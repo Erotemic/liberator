@@ -3,7 +3,7 @@ Statically ports utilities from ubelt needed by xdoctest.
 """
 
 
-def test_liberate_ubelt():
+def test_liberate_ubelt(tmp_path):
     import ubelt as ub
 
     # Uses netharn closer until it is ported to a standalone module
@@ -11,28 +11,27 @@ def test_liberate_ubelt():
     lib = Liberator()
 
     from ubelt import util_import
-    lib.add_dynamic(util_import.split_modpath)
-    lib.add_dynamic(util_import.modpath_to_modname)
-    lib.add_dynamic(util_import.modname_to_modpath)
-    lib.add_dynamic(util_import.import_module_from_name)
-    lib.add_dynamic(util_import.import_module_from_path)
-    lib.add_dynamic(util_import._pkgutil_modname_to_modpath)
-    lib.add_dynamic(util_import._importlib_import_modpath)
-    lib.add_dynamic(util_import.is_modname_importable)
+
+    target_names = [
+        'split_modpath',
+        'modpath_to_modname',
+        'modname_to_modpath',
+        'import_module_from_name',
+        'import_module_from_path',
+        '_pkgutil_modname_to_modpath',
+        '_importlib_import_modpath',
+        'is_modname_importable',
+    ]
+
+    added_names = []
+    for name in target_names:
+        func = getattr(util_import, name, None)
+        if func is not None:
+            lib.add_dynamic(func)
+            added_names.append(name)
 
     lib.expand(['ubelt'])
     text = lib.current_sourcecode()
-    print(text)
-
-    # if 0:
-    #     import redbaron
-    #     new_baron = redbaron.RedBaron(text)
-    #     new_names = [n.name for n in new_baron.node_list if n.type in ['class', 'def']]
-    #     import xdoctest
-    #     old_baron = redbaron.RedBaron(open(xdoctest.utils.util_import.__file__, 'r').read())
-    #     old_names = [n.name for n in old_baron.node_list if n.type in ['class', 'def']]
-    #     set(old_names) - set(new_names)
-    #     set(new_names) - set(old_names)
 
     prefix = ub.codeblock(
         '''
@@ -44,7 +43,37 @@ def test_liberate_ubelt():
         ''')
 
     final_text = prefix + '\n' + text + '\n'
-    print(final_text)
 
-    # fpath = ub.expandpath('~/code/xdoctest/xdoctest/utils/util_import.py')
-    # open(fpath, 'w').write()
+    ns = {}
+    exec(final_text, ns, ns)
+
+    pkg_dpath = tmp_path / 'demo_pkg'
+    pkg_dpath.mkdir()
+    (pkg_dpath / '__init__.py').write_text('')
+    (pkg_dpath / 'submod.py').write_text('value = 1\n')
+    mod_fpath = pkg_dpath / 'submod.py'
+
+    # Check that liberated functions have equivalent behavior to ubelt
+    for name in added_names:
+        assert name in ns
+
+    assert ns['split_modpath'](mod_fpath) == util_import.split_modpath(mod_fpath)
+    assert ns['modpath_to_modname'](mod_fpath, check=True, relativeto=tmp_path) == util_import.modpath_to_modname(mod_fpath, check=True, relativeto=tmp_path)
+
+    lib_modpath = ns['modname_to_modpath']('demo_pkg.submod', sys_path=[tmp_path])
+    ref_modpath = util_import.modname_to_modpath('demo_pkg.submod', sys_path=[tmp_path])
+    assert lib_modpath == ref_modpath
+
+    assert ns['import_module_from_name']('math').__name__ == util_import.import_module_from_name('math').__name__
+
+    lib_mod = ns['import_module_from_path'](mod_fpath)
+    ref_mod = util_import.import_module_from_path(mod_fpath)
+    assert lib_mod.__name__ == ref_mod.__name__
+
+    if '_importlib_import_modpath' in added_names:
+        lib_mod2 = ns['_importlib_import_modpath'](mod_fpath)
+        ref_mod2 = util_import._importlib_import_modpath(mod_fpath)
+        assert lib_mod2.__name__ == ref_mod2.__name__
+
+    assert ns['is_modname_importable']('demo_pkg.submod', sys_path=[tmp_path]) == util_import.is_modname_importable('demo_pkg.submod', sys_path=[tmp_path])
+    assert ns['is_modname_importable']('this.module.does.not.exist') == util_import.is_modname_importable('this.module.does.not.exist')

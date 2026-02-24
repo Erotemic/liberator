@@ -28,8 +28,40 @@ def find_import_stars(text):
         >>> print('----------')
         >>> print(ub.highlight_code(final_text))
     """
+    import ast
     import parso
     import ubelt as ub
+    from liberator.core import DefinitionVisitor
+
+    def _public_exports(modname):
+        modpath = ub.modname_to_modpath(modname)
+        if modpath is None:
+            return set()
+        try:
+            source = ub.Path(modpath).read_text()
+        except Exception:
+            return set()
+        try:
+            pt = ast.parse(source)
+        except Exception:
+            return set()
+
+        explicit = None
+        for node in pt.body:
+            if isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if isinstance(target, ast.Name) and target.id == '__all__':
+                        try:
+                            value = ast.literal_eval(node.value)
+                        except Exception:
+                            value = None
+                        if isinstance(value, (list, tuple)) and all(isinstance(v, str) for v in value):
+                            explicit = set(value)
+        if explicit is not None:
+            return explicit
+
+        visitor = DefinitionVisitor.parse(source=source, modpath=modpath, modname=modname)
+        return {d.name for d in visitor.definitions.values() if not d.name.startswith('_')}
     import_star_infos = []
     mod = parso.parse(text)
     for node in mod.iter_imports():
@@ -64,13 +96,15 @@ def find_import_stars(text):
     names = undefined_names(new_code)
     # Now we need to associate which undefined name comes from which import *
     new_lines = []
-    associated = names  # hack only works for one
+    unmatched = set(names)
     for info in import_star_infos:
         modname = info['modname']
+        exports = _public_exports(modname)
+        associated = sorted(unmatched & exports)
         if associated:
+            unmatched.difference_update(associated)
             associated_part = ', '.join(associated)
             new_lines.append(f'from {modname} import {associated_part}')
-        associated = None
     # But if there is just one, then we can skip this check in some cases.
     final_text = '\n'.join(new_lines) + '\n' + new_code
     return final_text
